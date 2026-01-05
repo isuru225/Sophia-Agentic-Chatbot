@@ -1,0 +1,5 @@
+langchain-mcp-adapters
+langchain[google-genai]
+fastmcp
+mysql-connector-python>=9.1.0
+streamlit
