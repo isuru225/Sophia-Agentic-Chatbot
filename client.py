@@ -4,91 +4,123 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from dotenv import load_dotenv
 import os
 import asyncio
+import threading
+import pandas as pd
 
 load_dotenv()
 
-# Global agent cache (initialized once, reused for efficiency)
+# ------------------------------
+# Global caches
+# ------------------------------
 _agent = None
 _client = None
+_loop = None
+_loop_thread = None
 
-async def get_agent():
-    """
-    Initialize and return the agent with MCP tools.
-    Uses caching to avoid re-initializing on every call.
-    """
+
+def _start_background_loop():
+    """Start a dedicated asyncio event loop in a background thread."""
+    global _loop, _loop_thread
+
+    if _loop is None:
+        _loop = asyncio.new_event_loop()
+
+        def run_loop():
+            asyncio.set_event_loop(_loop)
+            _loop.run_forever()
+
+        _loop_thread = threading.Thread(target=run_loop, daemon=True)
+        _loop_thread.start()
+
+
+async def _get_agent_async():
+    """Async initialization of agent and MCP tools (runs once)."""
     global _agent, _client
-    
-    if _agent is None:
-        # Step 1: Initialize MCP Client (connects to math and mysql servers)
-        _client = MultiServerMCPClient(
-            {
-                "math": {
-                    "transport": "stdio",
-                    "command": "python",
-                    "args": ["servers/mcp-math-server.py"],
-                },
-                "mysql": {
-                    "transport": "stdio",
-                    "command": "python",
-                    "args": ["servers/mcp-mysql-server.py"]
-                }
-            }
-        )
-        
-        # Step 2: Initialize LLM (Gemini model)
-        model = ChatGoogleGenerativeAI(
-            model="gemini-2.5-flash-lite",  # Using supported model
-            google_api_key=os.getenv("GEMINI_API_KEY"),
-            temperature=0.1,
-            max_tokens=1000,
-            timeout=30
-        )
-        
-        # Step 3: Get tools from MCP servers
-        tools = await _client.get_tools()
-        
-        # Step 4: Create agent with LLM and tools
-        _agent = create_agent(model, tools)
-    
+
+    if _agent is not None:
+        return _agent
+
+    #MCP client
+    _client = MultiServerMCPClient(
+        {
+            "math": {
+                "transport": "stdio",
+                "command": "python",
+                "args": ["servers/mcp-math-server.py"],
+            },
+            "mysql": {
+                "transport": "stdio",
+                "command": "python",
+                "args": ["servers/mcp-mysql-server.py"],
+            },
+        }
+    )
+
+    #Gemini LLM
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY not found in environment variables")
+
+    model = ChatGoogleGenerativeAI(
+        model="gemini-2.5-flash-lite",
+        google_api_key=api_key,
+        temperature=0.1,
+        max_tokens=1000,
+        timeout=30,
+    )
+
+    #MCP tools
+    tools = await _client.get_tools()
+
+    #Agent
+    _agent = create_agent(model, tools)
+
     return _agent
 
-async def ask_agent(user_prompt: str) -> str:
-    """
-    Process a user query through the LLM agent.
-    
-    Flow:
-    1. User prompt comes in
-    2. Agent (LLM) analyzes the prompt
-    3. Agent decides if tools are needed (MySQL, Math, etc.)
-    4. If tools needed, agent calls them via MCP
-    5. Agent processes tool results and generates final answer
-    6. Returns the response text
-    
-    Args:
-        user_prompt: The user's question/request
-        
-    Returns:
-        The agent's response as a string
-    """
-    agent = await get_agent()
-    
-    # Invoke agent with user message
-    response = await agent.ainvoke(
+def extract_final_answer(result):
+    for msg in reversed(result["messages"]):
+        if msg.__class__.__name__ == "ToolMessage":
+            content = msg.content
+
+            # Case 1: Table-like (list of dicts)
+            if isinstance(content, list) and all(isinstance(row, dict) for row in content):
+                return {"type": "table", "data": pd.DataFrame(content)}
+
+            # Case 2: Bullet points (list of strings)
+            elif isinstance(content, list):
+                bullet_points = [part["text"] for part in content if "text" in part]
+                return {"type": "bullet", "data": bullet_points}
+
+            # Case 3: Plain text
+            return {"type": "text", "data": str(content)}
+
+    return {"type": "text", "data": "No result returned."}
+
+async def _ask_agent_async(user_prompt: str) -> str:
+    agent = await _get_agent_async()
+
+    result = await agent.ainvoke(
         {"messages": [{"role": "user", "content": user_prompt}]}
     )
-    
-    # Extract the final response text from the agent's messages
-    return response["messages"][-1].content
 
-# Sync wrapper for Streamlit (which doesn't handle async directly)
+    final_text = extract_final_answer(result)
+
+    print("\n================ FINAL ANSWER ================\n")
+    print(final_text)
+    print("\n=============================================\n")
+
+    return final_text
+
+
 def ask_agent_sync(user_prompt: str) -> str:
-    """Synchronous wrapper for ask_agent - use this from Streamlit"""
-    return asyncio.run(ask_agent(user_prompt))
+    """
+    Safe synchronous wrapper for Streamlit.
+    Uses a background event loop (NO asyncio.run()).
+    """
+    _start_background_loop()
 
-async def main():
-    """Original main function for testing"""
-    mysql_response = await ask_agent("Give me the order numbers of salesman Jagath")
-    print("MySQL response: ", mysql_response)
+    future = asyncio.run_coroutine_threadsafe(
+        _ask_agent_async(user_prompt), _loop
+    )
 
-if __name__ == "__main__":
-    asyncio.run(main())
+    return future.result()
